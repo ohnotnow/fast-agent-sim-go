@@ -84,3 +84,7 @@ go test ./...
 ```
 
 Releases are built by GitHub Actions when a `v*` tag is pushed.
+
+## Licence
+
+MIT - see [LICENSE](LICENSE).
