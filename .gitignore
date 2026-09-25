@@ -1,0 +1,7 @@
+/fast-agent-sim-go
+*.exe
+.env
+/fas
+/fas-*
+# exported recordings land in the working directory; ship them via internal/fas/demos/
+/*.jsonl
