@@ -161,7 +161,7 @@ func estimatePlaytime(events []Event) float64 {
 		} else {
 			total += pacedGap(e.T, prev)
 			if e.Type == "text" {
-				total += float64(len(strings.Fields(e.Text))) * wordInterval
+				total += float64(strings.Count(e.Text, "\n")+1) * lineInterval
 			}
 		}
 		t := e.T

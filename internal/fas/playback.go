@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/muesli/cancelreader"
+	"golang.org/x/term"
 )
 
 // Playback compresses the recorded pauses speed-fold, with long thinks
@@ -43,7 +44,7 @@ const (
 	tokenFrom      = 30       // bare unbroken runs this long read as pastes too
 	readingPause   = 2.0      // the human reads the reply before typing again
 	autoSendPause  = 1.2      // auto mode: the beat before "pressing" Return
-	wordInterval   = 0.012    // per-word delay while streaming prose
+	lineInterval   = 0.02     // per-line beat while the reply rolls in
 )
 
 var spinnerVerbs = []string{"Thinking", "Pondering", "Rummaging", "Scheming", "Noodling"}
@@ -52,6 +53,7 @@ var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 var (
 	errQuit        = errors.New("quit")
 	errInterrupted = errors.New("interrupted")
+	errSkip        = errors.New("skip the typing")
 )
 
 func keystrokeSeconds() float64 { return 60.0 / (typingWPM * 5) } // 5 chars = one word
@@ -60,6 +62,8 @@ type player struct {
 	ctx  context.Context
 	out  io.Writer
 	auto bool
+	keys chan error // key events while a prompt is typed (see watchKeys)
+	raw  bool       // terminal is in raw mode
 }
 
 // play performs a script from the top. It returns errInterrupted on
@@ -148,6 +152,8 @@ func (p *player) sleep(seconds float64) error {
 	select {
 	case <-p.ctx.Done():
 		return errInterrupted
+	case err := <-p.keys: // nil (blocks forever) unless a prompt is being typed
+		return err
 	case <-timer.C:
 		return nil
 	}
@@ -155,37 +161,29 @@ func (p *player) sleep(seconds float64) error {
 
 func jitter() float64 { return 0.7 + rand.Float64()*0.6 }
 
-// presentPrompt types the recorded prompt at the ❯. Pastes land as a
-// beat for the off-stage copy, then the whole chunk at once - nobody
-// types a stack trace character by character.
+// presentPrompt types the recorded prompt at the ❯, then waits for
+// Return to send it. Hidden extra: Return while it is still being typed
+// fills in the rest and sends it at once, for re-running a session
+// without sitting through the typing every time.
 func (p *player) presentPrompt(text string) error {
 	fmt.Fprint(p.out, stylePrompt.Render("❯")+" ")
-	if err := p.sleep(readingPause * jitter()); err != nil {
+	watch := p.watchKeys()
+	if watch != nil {
+		p.keys, p.raw = watch.events, true
+	}
+	typed, err := p.typePrompt(text)
+	if watch != nil {
+		p.keys, p.raw = nil, false
+		watch.stop()
+	}
+	switch {
+	case errors.Is(err, errSkip):
+		fmt.Fprintln(p.out, text[typed:])
+		return nil
+	case err != nil:
 		return err
 	}
-	keystroke := keystrokeSeconds()
-	for _, seg := range segments(text) {
-		if seg.paste {
-			if err := p.sleep(pastePause * jitter()); err != nil {
-				return err
-			}
-			fmt.Fprint(p.out, seg.text)
-			if err := p.sleep(pastePause * jitter()); err != nil {
-				return err
-			}
-			continue
-		}
-		for _, r := range seg.text {
-			fmt.Fprint(p.out, string(r))
-			pause := keystroke * (typeJitterLow + rand.Float64()*(typeJitterHigh-typeJitterLow))
-			if strings.ContainsRune(pauseKeys, r) {
-				pause += keystroke * 3
-			}
-			if err := p.sleep(pause); err != nil {
-				return err
-			}
-		}
-	}
+
 	if p.auto {
 		if err := p.sleep(autoSendPause * jitter()); err != nil {
 			return err
@@ -201,6 +199,110 @@ func (p *player) presentPrompt(text string) error {
 		return errQuit
 	}
 	return nil
+}
+
+// typePrompt performs the typing and returns how many bytes of text are
+// on screen, so a skip can print exactly the rest. Pastes land as a beat
+// for the off-stage copy, then the whole chunk at once - nobody types a
+// stack trace character by character.
+func (p *player) typePrompt(text string) (int, error) {
+	typed := 0
+	if err := p.sleep(readingPause * jitter()); err != nil {
+		return typed, err
+	}
+	keystroke := keystrokeSeconds()
+	for _, seg := range segments(text) {
+		if seg.paste {
+			if err := p.sleep(pastePause * jitter()); err != nil {
+				return typed, err
+			}
+			p.emit(seg.text)
+			typed += len(seg.text)
+			if err := p.sleep(pastePause * jitter()); err != nil {
+				return typed, err
+			}
+			continue
+		}
+		for _, r := range seg.text {
+			p.emit(string(r))
+			typed += utf8.RuneLen(r)
+			pause := keystroke * (typeJitterLow + rand.Float64()*(typeJitterHigh-typeJitterLow))
+			if strings.ContainsRune(pauseKeys, r) {
+				pause += keystroke * 3
+			}
+			if err := p.sleep(pause); err != nil {
+				return typed, err
+			}
+		}
+	}
+	return typed, nil
+}
+
+// emit writes typed prompt text; in raw mode the terminal no longer
+// turns "\n" into a new line at column 0, so we do it ourselves.
+func (p *player) emit(s string) {
+	if p.raw {
+		s = strings.ReplaceAll(s, "\n", "\r\n")
+	}
+	fmt.Fprint(p.out, s)
+}
+
+type keyWatch struct {
+	events chan error
+	stop   func()
+}
+
+// watchKeys listens for Return (skip), Ctrl-C and Ctrl-D while a prompt
+// is typed. The terminal goes raw so the keypress isn't echoed into the
+// middle of the prompt; stop restores it. Nil when there's no terminal
+// to listen to, or nobody at it (auto mode).
+func (p *player) watchKeys() *keyWatch {
+	fd := int(os.Stdin.Fd())
+	if p.auto || !term.IsTerminal(fd) {
+		return nil
+	}
+	state, err := term.MakeRaw(fd)
+	if err != nil {
+		return nil
+	}
+	r, err := cancelreader.NewReader(os.Stdin)
+	if err != nil {
+		term.Restore(fd, state)
+		return nil
+	}
+	events := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64)
+		for {
+			n, err := r.Read(buf)
+			for _, b := range buf[:n] {
+				var event error
+				switch b {
+				case '\r', '\n':
+					event = errSkip
+				case 3: // Ctrl-C arrives as a byte in raw mode, not a signal
+					event = errInterrupted
+				case 4: // Ctrl-D
+					event = errQuit
+				}
+				if event != nil {
+					events <- event
+					return
+				}
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return &keyWatch{events: events, stop: func() {
+		r.Cancel()
+		<-done
+		r.Close()
+		term.Restore(fd, state)
+	}}
 }
 
 func isQuit(reply string) bool {
@@ -256,20 +358,15 @@ func readLine(ctx context.Context) (string, error) {
 	}
 }
 
-// streamProse prints word by word so it reads as generated, not pasted.
+// streamProse rolls the reply in a line at a time: effectively instant,
+// as a 10x model would be, but sequential, because a 0ms splat reads
+// as pasted rather than generated.
 func (p *player) streamProse(text string) error {
 	for line := range strings.SplitSeq(text, "\n") {
-		words := strings.Fields(line)
-		for i, word := range words {
-			if i < len(words)-1 {
-				word += " "
-			}
-			fmt.Fprint(p.out, word)
-			if err := p.sleep(wordInterval); err != nil {
-				return err
-			}
+		fmt.Fprintln(p.out, line)
+		if err := p.sleep(lineInterval); err != nil {
+			return err
 		}
-		fmt.Fprintln(p.out)
 	}
 	return nil
 }
